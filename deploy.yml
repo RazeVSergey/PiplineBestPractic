@@ -1,0 +1,174 @@
+stages:
+  - build-backend
+  - build-frontend
+  - deploy
+  - notification
+  - cleanup
+
+
+
+variables:
+  SUBDOMAIN: ${CI_COMMIT_REF_SLUG}.${CI_PROJECT_NAME}
+  PROJECT_NAME: ${CI_COMMIT_REF_SLUG}_${CI_PROJECT_NAME}
+  BACKEND_IMAGE: github.com/clients/${CI_PROJECT_NAME}/${CI_COMMIT_REF_SLUG}/backend
+  FRONTEND_IMAGE: github.com/clients/${CI_PROJECT_NAME}/${CI_COMMIT_REF_SLUG}/frontend
+
+
+.connect:
+  image: dwdraju/ssh-client-alpine
+  before_script:
+     - 'which  ssh-agent || ( apk update && apk upgrade && apk add --update --no-cache openssh-client curl bash git ca-certificates)' 
+     - mkdir -p ~/.ssh
+     - chmod 700 ~/.ssh
+     - chmod 600 ~/.ssh/id_rsa
+     - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+     #- echo $SSH_PRIVATE_KEY >  ~/.ssh/id_rsa
+     #- echo -e "Host *\n\tStrictHostKeyChecking no\n\tAddKeysToAgent yes\n\tUseKeychain yes\n\tIdentityFile ~/.ssh/id_rsa\n" > ~/.ssh/config
+     - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+     - '[[ -f /.dockerenv ]] && echo -e "Host *\nStrictHostKeyChecking no\nLogLevel quiet\n" > ~/.ssh/config'
+
+
+.base_deploy: &base_deploy
+  name: $CI_COMMIT_REF_SLUG
+  url:  http://${CI_COMMIT_REF_SLUG}.${CI_PROJECT_NAME}.com
+
+
+#######################################
+#              Stage                  #
+#          Build backend              #
+#######################################
+
+build_baсkend_image:
+  stage: build-backend
+  script:
+    - |
+      docker build -f docker/Dockerfile.backend -t ${BACKEND_IMAGE}:latest .
+      if [ ${CI_JOB_STATUS} = "failed" ]; then
+        curl --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" "${CI_API_V4_URL}/projects/$CI_PROJECT_ID/pipelines/$CI_PIPELINE_ID/cancel"
+      else
+        docker push ${BACKEND_IMAGE}:latest
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+      changes:
+        - "backend/**/*"
+      when: always
+    - changes:
+        - "backend/**/*"
+      when: manual
+  tags:
+    - build-docker-image
+  allow_failure: false
+
+#######################################
+#              Stage                  #
+#          Build frontend             #
+#######################################
+
+build_frontend_image:
+  #image: docker:latest
+  stage: build-frontend
+  script:
+    - |
+      echo "Building $dockerfile..."
+      docker build --no-cache --build-arg BUILD_REV=${CI_COMMIT_SHORT_SHA} -f docker/Dockerfile.frontend -t ${FRONTEND_IMAGE}:latest .
+      if [ ${CI_JOB_STATUS} = "failed" ]; then
+        curl --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" "${CI_API_V4_URL}/projects/$CI_PROJECT_ID/pipelines/$CI_PIPELINE_ID/cancel"
+      else
+        docker push ${FRONTEND_IMAGE}:latest
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+      changes:
+        - "Frontend/**/*"
+      when: always
+    - changes:
+        - "Frontend/**/*"
+      when: manual
+  tags:
+    - build-docker-image
+  allow_failure: false
+
+#######################################
+#           Stage Deploy              #
+#######################################
+
+deploy:
+  stage: deploy
+  <<: *connect
+  variables:
+      COMMIT_REF_NAME: $CI_COMMIT_REF_NAME
+      NAME_PROJECT: $CI_PROJECT_NAME
+  environment:
+    <<: *base_deploy
+    on_stop: stop_review_app
+    auto_stop_in: 1 day
+  rules:
+    - changes:
+        - "Backend/**/*"
+      when: always
+    - changes:
+        - "Frontend/**/*"
+      when: always
+  script:
+    - |
+      echo -e "\nCI_PIPELINE_IID="$CI_PIPELINE_IID"\nCI_PROJECT_PATH_SLUG="$CI_PROJECT_PATH_SLUG"\nCI_PIPELINE_URL="$CI_PIPELINE_URL"\nCI_COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA"\nCI_COMMIT_SHA="$CI_COMMIT_SHA"\nCI_PROJECT_URL="$CI_PROJECT_URL"\nCI_JOB_ID="$CI_JOB_ID"\nCI_JOB_URL="$CI_JOB_URL"\nLINK_ARTIFACT=true" >> docker/.env
+
+      echo "Deploy project on server $SSH_HOST"
+
+      #check exist image registry else replace in latest
+      [[ $(docker search  github.com/clients/${CI_PROJECT_NAME}/${CI_COMMIT_REF_SLUG} | grep  'backend') == "" ]] && grep -Flr  "backend:latest" ./cicd/docker-compose.yml  | xargs  sed -i -e  's/${CI_COMMIT_REF_SLUG}/master/g'
+      [[ $(docker search  github.com/clients/${CI_PROJECT_NAME}/${CI_COMMIT_REF_SLUG} | grep  'frontend') == "" ]] && grep -Flr  "frontend:latest" ./cicd/docker-compose.yml  | xargs  sed -i -e  's/${CI_COMMIT_REF_SLUG}/master/g'
+
+      ssh $SSH_USER@$SSH_HOST "docker-compose -f ./cicd/docker-compose.yml --project-name=${PROJECT_NAME} up -d"
+  tags:
+    - deploy_runner
+  when: on_success
+
+#####################################
+#            Send message           #
+#      commit  to discord chanell   #
+#####################################
+
+# If  build have status success
+success_notification:
+  stage: notification
+  rules:
+    - changes:
+        - "Backend/**/*"
+      when: always
+    - changes:
+        - "Frontend/**/*"
+      when: always
+  script:
+    - wget https://raw.githubusercontent.com/DiscordHooks/gitlab-ci-discord-webhook/master/send.sh
+    - chmod +x send.sh
+    - ./send.sh success $WEBHOOK_URL
+  when: on_success
+
+# If  build have status failure
+failure_notification:
+  stage: notification
+  script:
+    - wget https://raw.githubusercontent.com/DiscordHooks/gitlab-ci-discord-webhook/master/send.sh
+    - chmod +x send.sh
+    - ./send.sh failure $WEBHOOK_URL
+  when: on_failure
+
+
+#######################################
+#              Stage                  #
+#     Stop run dokcer container       #
+#######################################
+
+stop_review_app:
+  stage: cleanup
+  when: manual
+  environment:
+    <<: *base_deploy
+    action: stop
+  script:
+    - docker-compose -f ./cicd/docker-compose.yml --project-name=${CI_COMMIT_REF_NAME}_${CI_PROJECT_NAME}   down --remove-orphans
+  tags:
+    - deploy_runner
+
