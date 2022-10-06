@@ -10,3 +10,10 @@ See demployments -> Environments
 
 ![](./image/Gitlab_env.png)
 
+Depending on how the pipeline was executed, a message will be sent to the discord: failed or successful
+
+If failed to
+![](./image/failed_build_pipline.png)
+
+If successful to
+![](./image/good build pipline.png)
